@@ -319,7 +319,6 @@ class SelectionWayBot:
                     for pdf in item["pdfs"]:
                         f.write(f'{prefix} PDF : {pdf}\n')
                         total_pdfs += 1
-                    f.write("\n")
 
         return filename, total_videos, total_pdfs
 
