@@ -219,120 +219,85 @@ class SelectionWayBot:
         return message, batch_list
 
     def extract_all_data(self, classes_data, pdf_url, course_details):
-        """
-        Actual Selection Way response structure:
-          data.classes[] = topic groups
-          topicGroup.topicName = topic/folder
-          topicGroup.classes[] = classes
-          class.section.sectionName = MAIN FOLDER
-          class.topic.topicName = API topic metadata
-          class.title = CLASS NAME
-          class.mp4Recordings/class_link = VIDEO
-          class.classPdf[] = PDFs for that class
-
-        Classes are grouped by section.sectionName so English/Math/etc. never mix.
-        Within each section, topic order from the API is retained and classes are sorted by their API priority, without mixing topics.
-        """
         groups = []
-        by_section = {}
-
+        batch_pdf = self.clean_url(pdf_url) if pdf_url else ""
         raw_topics = classes_data.get("classes", []) if isinstance(classes_data, dict) else []
 
+        def priority_key(cls):
+            value = cls.get("priority")
+            try:
+                return (value is None, int(value))
+            except (TypeError, ValueError):
+                return (True, 0)
+
+        current_group = None
+        current_main_folder = None
+
+        # Preserve the API/app topic-group sequence. Never merge topic names
+        # globally: the same topic can occur again later in the response.
         for topic_group in raw_topics:
             if not isinstance(topic_group, dict):
                 continue
-            wrapper_topic = str(topic_group.get("topicName") or "Unknown Topic").strip()
 
-            for cls in topic_group.get("classes", []) or []:
-                if not isinstance(cls, dict):
-                    continue
+            wrapper_topic = str(topic_group.get("topicName") or topic_group.get("title") or "Unknown Topic").strip()
+            raw_classes = [c for c in (topic_group.get("classes") or []) if isinstance(c, dict)]
+            if not raw_classes:
+                continue
 
+            # Sort ONLY within this exact topic group.
+            raw_classes.sort(key=priority_key)
+
+            section_buckets = []
+            section_map = {}
+            for cls in raw_classes:
                 section_obj = cls.get("section") or {}
-                main_folder = str(
-                    section_obj.get("sectionName")
-                    or cls.get("sectionName")
-                    or "Unknown Section"
-                ).strip()
+                main_folder = str(section_obj.get("sectionName") or cls.get("sectionName") or "Unknown Section").strip()
+                if main_folder not in section_map:
+                    bucket = {"main_folder": main_folder, "classes": []}
+                    section_map[main_folder] = bucket
+                    section_buckets.append(bucket)
+                section_map[main_folder]["classes"].append(cls)
 
-                # API's topic wrapper is the actual class-group/topic order.
-                topic_name = wrapper_topic
-                class_title = str(cls.get("title") or "Unknown Class").strip()
+            for bucket in section_buckets:
+                main_folder = bucket["main_folder"]
+                if current_group is None or current_main_folder != main_folder:
+                    current_group = {"main_folder": main_folder, "topics": []}
+                    groups.append(current_group)
+                    current_main_folder = main_folder
 
-                recordings = cls.get("mp4Recordings") or []
-                best_url = ""
-                for quality in ("720p", "480p", "360p"):
-                    for rec in recordings:
-                        if isinstance(rec, dict) and rec.get("quality") == quality and rec.get("url"):
-                            best_url = self.clean_url(rec["url"])
+                topic_entry = {"topic": wrapper_topic, "classes": []}
+                for cls in bucket["classes"]:
+                    class_title = str(cls.get("title") or "Unknown Class").strip()
+                    recordings = cls.get("mp4Recordings") or []
+                    best_url = ""
+                    for quality in ("720p", "480p", "360p"):
+                        for rec in recordings:
+                            if isinstance(rec, dict) and rec.get("quality") == quality and rec.get("url"):
+                                best_url = self.clean_url(rec["url"])
+                                break
+                        if best_url:
                             break
-                    if best_url:
-                        break
-                if not best_url:
-                    best_url = self.clean_url(cls.get("class_link", ""))
+                    if not best_url:
+                        best_url = self.clean_url(cls.get("class_link", ""))
 
-                pdfs = []
-                for pdf in cls.get("classPdf") or []:
-                    if isinstance(pdf, dict):
-                        purl = pdf.get("url", "")
-                    elif isinstance(pdf, str):
-                        purl = pdf
-                    else:
-                        purl = ""
-                    if purl:
-                        pdfs.append(self.clean_url(purl))
+                    pdfs = []
+                    for pdf in cls.get("classPdf") or []:
+                        purl = pdf.get("url", "") if isinstance(pdf, dict) else (pdf if isinstance(pdf, str) else "")
+                        if purl:
+                            pdfs.append(self.clean_url(purl))
+                    if not best_url and not pdfs:
+                        continue
 
-                if not best_url and not pdfs:
-                    continue
+                    topic_entry["classes"].append({
+                        "topic": wrapper_topic, "class_name": class_title,
+                        "video": best_url, "pdfs": pdfs, "priority": cls.get("priority")
+                    })
 
-                if main_folder not in by_section:
-                    by_section[main_folder] = {
-                        "main_folder": main_folder,
-                        "topics": [],
-                        "_topic_map": {}
-                    }
-                    groups.append(by_section[main_folder])
+                if topic_entry["classes"]:
+                    current_group["topics"].append(topic_entry)
 
-                group = by_section[main_folder]
-                topic_key = topic_name
+        return groups, batch_pdf
 
-                # Keep topics in the exact order in which the API/app returns them.
-                if topic_key not in group["_topic_map"]:
-                    topic_group = {
-                        "topic": topic_name,
-                        "classes": []
-                    }
-                    group["_topic_map"][topic_key] = topic_group
-                    group["topics"].append(topic_group)
-
-                group["_topic_map"][topic_key]["classes"].append({
-                    "topic": topic_name,
-                    "class_name": class_title,
-                    "video": best_url,
-                    "pdfs": pdfs,
-                    "priority": cls.get("priority")
-                })
-
-        # The API can return classes in a different order.  Sort ONLY inside
-        # each topic, never across topics or main folders.
-        for group in groups:
-            for topic_group in group["topics"]:
-                classes = topic_group["classes"]
-
-                def priority_key(item):
-                    value = item.get("priority")
-                    try:
-                        return (value is None, int(value))
-                    except (TypeError, ValueError):
-                        return (True, 0)
-
-                topic_group["classes"] = sorted(classes, key=priority_key)
-
-            # Internal helper is not needed by the writer.
-            group.pop("_topic_map", None)
-
-        return groups, self.clean_url(pdf_url) if pdf_url else ""
-
-        return groups, self.clean_url(pdf_url) if pdf_url else ""
 
     def create_course_file(self, course_name, groups, batch_pdf):
         clean_name = "".join(c for c in course_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
@@ -344,29 +309,23 @@ class SelectionWayBot:
             f.write(f"🎯 {course_name}\n\n")
             if batch_pdf:
                 f.write("📄 BATCH INFO PDF\n")
-                f.write(f"Batch Info PDF : {batch_pdf}\n\n")
+                f.write(f"Batch Info PDF : {batch_pdf}\n")
 
             for group in groups:
                 main_folder = group["main_folder"]
-
-                # Main folder -> Topic -> classes.
-                # Topics remain in API/app order and classes are already
-                # sorted by priority inside each topic.
                 for topic_group in group.get("topics", []):
                     topic_name = topic_group["topic"]
-
-                    for item in topic_group["classes"]:
+                    for item in topic_group.get("classes", []):
                         prefix = f'{main_folder} | {topic_name} | {item["class_name"]}'
-
-                        if item["video"]:
+                        if item.get("video"):
                             f.write(f'{prefix} : {item["video"]}\n')
                             total_videos += 1
-
-                        for pdf in item["pdfs"]:
+                        for pdf in item.get("pdfs", []):
                             f.write(f'{prefix} PDF : {pdf}\n')
                             total_pdfs += 1
 
         return filename, total_videos, total_pdfs
+
 
 
 bot = SelectionWayBot()
