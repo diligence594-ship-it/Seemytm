@@ -231,7 +231,7 @@ class SelectionWayBot:
           class.classPdf[] = PDFs for that class
 
         Classes are grouped by section.sectionName so English/Math/etc. never mix.
-        Within each section, topic order and class order from the API are retained.
+        Within each section, topic order from the API is retained and classes are sorted by their API priority, without mixing topics.
         """
         groups = []
         by_section = {}
@@ -285,15 +285,52 @@ class SelectionWayBot:
                     continue
 
                 if main_folder not in by_section:
-                    by_section[main_folder] = {"main_folder": main_folder, "classes": []}
+                    by_section[main_folder] = {
+                        "main_folder": main_folder,
+                        "topics": [],
+                        "_topic_map": {}
+                    }
                     groups.append(by_section[main_folder])
 
-                by_section[main_folder]["classes"].append({
+                group = by_section[main_folder]
+                topic_key = topic_name
+
+                # Keep topics in the exact order in which the API/app returns them.
+                if topic_key not in group["_topic_map"]:
+                    topic_group = {
+                        "topic": topic_name,
+                        "classes": []
+                    }
+                    group["_topic_map"][topic_key] = topic_group
+                    group["topics"].append(topic_group)
+
+                group["_topic_map"][topic_key]["classes"].append({
                     "topic": topic_name,
                     "class_name": class_title,
                     "video": best_url,
                     "pdfs": pdfs,
+                    "priority": cls.get("priority")
                 })
+
+        # The API can return classes in a different order.  Sort ONLY inside
+        # each topic, never across topics or main folders.
+        for group in groups:
+            for topic_group in group["topics"]:
+                classes = topic_group["classes"]
+
+                def priority_key(item):
+                    value = item.get("priority")
+                    try:
+                        return (value is None, int(value))
+                    except (TypeError, ValueError):
+                        return (True, 0)
+
+                topic_group["classes"] = sorted(classes, key=priority_key)
+
+            # Internal helper is not needed by the writer.
+            group.pop("_topic_map", None)
+
+        return groups, self.clean_url(pdf_url) if pdf_url else ""
 
         return groups, self.clean_url(pdf_url) if pdf_url else ""
 
@@ -311,14 +348,23 @@ class SelectionWayBot:
 
             for group in groups:
                 main_folder = group["main_folder"]
-                for item in group["classes"]:
-                    prefix = f'{main_folder} | {item["topic"]} | {item["class_name"]}'
-                    if item["video"]:
-                        f.write(f'{prefix} : {item["video"]}\n')
-                        total_videos += 1
-                    for pdf in item["pdfs"]:
-                        f.write(f'{prefix} PDF : {pdf}\n')
-                        total_pdfs += 1
+
+                # Main folder -> Topic -> classes.
+                # Topics remain in API/app order and classes are already
+                # sorted by priority inside each topic.
+                for topic_group in group.get("topics", []):
+                    topic_name = topic_group["topic"]
+
+                    for item in topic_group["classes"]:
+                        prefix = f'{main_folder} | {topic_name} | {item["class_name"]}'
+
+                        if item["video"]:
+                            f.write(f'{prefix} : {item["video"]}\n')
+                            total_videos += 1
+
+                        for pdf in item["pdfs"]:
+                            f.write(f'{prefix} PDF : {pdf}\n')
+                            total_pdfs += 1
 
         return filename, total_videos, total_pdfs
 
