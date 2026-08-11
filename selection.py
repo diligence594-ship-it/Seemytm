@@ -396,15 +396,85 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif query.data == "list_batches":
         await query.edit_message_text("🔄 Loading all batches...")
-        success, result = await bot.get_all_batches()
-        if success:
-            batches_list, batch_list = bot.format_batches_list(result, "all")
-            context.user_data['all_batches'] = batch_list
+
+        try:
+            success, result = await bot.get_all_batches()
+
+            if not success:
+                await query.edit_message_text(f"❌ {result}")
+                return
+
+            # Save the complete batch list first.
+            context.user_data['all_batches'] = result
             context.user_data['awaiting_batch_id'] = True
             context.user_data['action_type'] = 'all_batches'
-            await query.edit_message_text(batches_list, parse_mode='Markdown')
-        else:
-            await query.edit_message_text(f"❌ {result}")
+
+            if not result:
+                await query.edit_message_text("❌ No active batches found.")
+                return
+
+            # Telegram messages have a ~4096 character limit.  The old code
+            # tried to edit one message with the complete list, so a large
+            # batch list could fail and leave "Loading all batches..." stuck.
+            chunks = []
+            current = "📚 *All Available Batches*\n\n"
+
+            for i, course in enumerate(result, 1):
+                title = str(course.get("title", "Unknown")).strip()
+                course_id = str(course.get("id", "N/A")).strip()
+                price = course.get("discountPrice", course.get("price", "N/A"))
+                category = (
+                    course.get("mainCategory", {}) or {}
+                ).get("mainCategoryName", "General")
+                course_type = (
+                    "🔴 LIVE" if course.get("isLive") else "📹 RECORDED"
+                )
+
+                entry = (
+                    f"*{i}. {title}*\n"
+                    f"   🆔 `{course_id}`\n"
+                    f"   📁 {category}\n"
+                    f"   💰 ₹{price} | {course_type}\n\n"
+                )
+
+                if len(current) + len(entry) > 3800:
+                    chunks.append(current)
+                    current = "📚 *All Available Batches (continued)*\n\n"
+
+                current += entry
+
+            if current.strip():
+                chunks.append(current)
+
+            # Show the first chunk by editing the button message.
+            await query.edit_message_text(
+                chunks[0],
+                parse_mode='Markdown'
+            )
+
+            # Send remaining chunks separately.
+            for chunk in chunks[1:]:
+                await query.message.reply_text(
+                    chunk,
+                    parse_mode='Markdown'
+                )
+
+            await query.message.reply_text(
+                "👉 Send the *batch ID* of the course you want to extract.",
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.exception("Error while loading batches")
+            try:
+                await query.edit_message_text(
+                    f"❌ Failed to load batches:\n`{str(e)[:300]}`",
+                    parse_mode='Markdown'
+                )
+            except Exception:
+                await query.message.reply_text(
+                    f"❌ Failed to load batches: {str(e)[:300]}"
+                )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
