@@ -1,16 +1,18 @@
 import asyncio
 import requests
+import json
 import logging
 import os
 from urllib.parse import quote, urlsplit, urlunsplit
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
+# Put your bot token in the BOT_TOKEN environment variable.
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
@@ -30,68 +32,84 @@ class SelectionWayBot:
             "referer": "https://www.selectionway.com/",
             "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "en-US,en;q=0.9",
+            "priority": "u=1, i"
         }
         self.user_sessions = {}
 
     def clean_url(self, url):
+        """Encode spaces in URL paths while preserving existing %XX escapes."""
         if not url:
             return ""
         url = str(url).strip()
         try:
-            p = urlsplit(url)
-            if not p.scheme or not p.netloc:
-                return quote(url, safe="/%:@!$&'()*+,;=~_-")
-            path = quote(p.path, safe="/%:@!$&'()*+,;=~_-")
-            return urlunsplit((p.scheme, p.netloc, path, p.query, p.fragment))
+            parts = urlsplit(url)
+            encoded_path = quote(parts.path, safe="/%:@!$&'()*+,;=~_-%")
+            return urlunsplit((parts.scheme, parts.netloc, encoded_path,
+                               parts.query, parts.fragment))
         except Exception:
             return url.replace(" ", "%20")
 
     async def get_all_batches(self):
-        url = "https://backend.multistreaming.site/api/courses/active?userId=1448640"
+        courses_url = "https://backend.multistreaming.site/api/courses/active?userId=1448640"
+        headers = {"host": "backend.multistreaming.site", **self.base_headers}
         try:
-            r = requests.get(url, headers={"host": "backend.multistreaming.site", **self.base_headers}, timeout=60)
-            r.raise_for_status()
-            j = r.json()
-            return (True, j.get("data", [])) if j.get("state") == 200 else (False, "Failed to get batches")
+            response = requests.get(courses_url, headers=headers, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("state") == 200:
+                return True, data.get("data", [])
+            return False, "Failed to get batches"
         except Exception as e:
             return False, f"Error: {e}"
 
     async def get_my_batches(self, user_id):
         if user_id not in self.user_sessions:
             return False, "Please login first"
-        u = self.user_sessions[user_id]
+        user_data = self.user_sessions[user_id]
+        url = "https://backend.multistreaming.site/api/courses/my-courses"
+        headers = {
+            "host": "backend.multistreaming.site",
+            "content-length": "20",
+            **self.base_headers
+        }
         try:
-            r = u["session"].post(
-                "https://backend.multistreaming.site/api/courses/my-courses",
-                headers={"host": "backend.multistreaming.site", **self.base_headers},
-                json={"userId": str(u["user_id"])},
-                timeout=60,
+            response = user_data['session'].post(
+                url, headers=headers,
+                json={"userId": str(user_data['user_id'])}, timeout=60
             )
-            r.raise_for_status()
-            j = r.json()
-            return (True, j.get("data", [])) if str(j.get("state")) == "200" else (False, "Failed to get your courses")
+            response.raise_for_status()
+            data = response.json()
+            if str(data.get("state")) == "200":
+                return True, data.get("data", [])
+            return False, "Failed to get your courses"
         except Exception as e:
             return False, f"Error: {e}"
 
     async def login_user(self, email, password, user_id):
+        url = "https://selectionway.hranker.com/admin/api/user-login"
+        headers = {
+            "host": "selectionway.hranker.com",
+            "content-length": "106",
+            **self.base_headers
+        }
+        payload = {
+            "email": email,
+            "password": password,
+            "mobile": "",
+            "otp": "",
+            "logged_in_via": "web",
+            "customer_id": 561
+        }
         try:
-            s = requests.Session()
-            r = s.post(
-                "https://selectionway.hranker.com/admin/api/user-login",
-                headers={"host": "selectionway.hranker.com", **self.base_headers},
-                json={
-                    "email": email, "password": password, "mobile": "",
-                    "otp": "", "logged_in_via": "web", "customer_id": 561
-                },
-                timeout=60,
-            )
-            r.raise_for_status()
-            j = r.json()
-            if j.get("state") == 200:
+            session = requests.Session()
+            response = session.post(url, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("state") == 200:
                 self.user_sessions[user_id] = {
-                    "user_id": j["data"]["user_id"],
-                    "token": j["data"].get("token_id"),
-                    "session": s,
+                    "user_id": data["data"]["user_id"],
+                    "token": data["data"]["token_id"],
+                    "session": session
                 }
                 return True, "✅ Login successful!"
             return False, "❌ Login failed: Invalid credentials"
@@ -100,186 +118,214 @@ class SelectionWayBot:
 
     async def extract_course_data_without_login(self, course_id, course_name):
         try:
-            r = requests.get(
-                f"https://backend.multistreaming.site/api/courses/{course_id}/classes?populate=full",
-                headers={"host": "backend.multistreaming.site", **self.base_headers},
-                timeout=60,
-            )
-            r.raise_for_status()
-            j = r.json()
-            if j.get("state") != 200:
+            url = f"https://backend.multistreaming.site/api/courses/{course_id}/classes?populate=full"
+            headers = {"host": "backend.multistreaming.site", **self.base_headers}
+            response = requests.get(url, headers=headers, timeout=60)
+            response.raise_for_status()
+            classes_response = response.json()
+
+            # Keep a copy for debugging/verification if needed.
+            with open("selectionway_response.json", "w", encoding="utf-8") as f:
+                json.dump(classes_response, f, ensure_ascii=False, indent=2)
+
+            if classes_response.get("state") != 200:
                 return False, "Failed to get course data"
 
-            all_ok, batches = await self.get_all_batches()
+            ok, batches = await self.get_all_batches()
             pdf_url = ""
-            if all_ok:
-                for b in batches:
-                    if b.get("id") == course_id:
-                        pdf_url = self.clean_url(b.get("batchInfoPdfUrl", ""))
+            if ok:
+                for batch in batches:
+                    if str(batch.get("id")) == str(course_id):
+                        pdf_url = self.clean_url(batch.get("batchInfoPdfUrl", ""))
                         break
 
-            return True, {"classes_data": j["data"], "pdf_url": pdf_url, "course_details": {"title": course_name}}
+            return True, {
+                "classes_data": classes_response["data"],
+                "pdf_url": pdf_url,
+                "course_details": {"title": course_name}
+            }
         except Exception as e:
             return False, f"Error: {e}"
 
     async def extract_course_data_with_login(self, user_id, course_id, course_name):
         if user_id not in self.user_sessions:
             return False, "Please login first!"
-        u = self.user_sessions[user_id]
+        user_data = self.user_sessions[user_id]
         try:
-            r = u["session"].post(
-                "https://backend.multistreaming.site/api/courses/by-id-2",
-                headers={"host": "backend.multistreaming.site", **self.base_headers},
-                json={"userId": str(u["user_id"]), "id": course_id},
-                timeout=60,
-            )
-            r.raise_for_status()
-            j = r.json()
-            if j.get("state") != 200:
-                return False, "Failed to get course details"
-            details = j["data"]
-            r = u["session"].get(
-                f"https://backend.multistreaming.site/api/courses/{course_id}/classes?populate=full",
-                headers={"host": "backend.multistreaming.site", **self.base_headers},
-                timeout=60,
-            )
-            r.raise_for_status()
-            cj = r.json()
-            if cj.get("state") != 200:
-                return False, "Failed to get course data"
-            return True, {
-                "classes_data": cj["data"],
-                "pdf_url": self.clean_url(details.get("batchInfoPdfUrl", "")),
-                "course_details": details,
+            course_url = "https://backend.multistreaming.site/api/courses/by-id-2"
+            course_headers = {
+                "host": "backend.multistreaming.site",
+                "content-length": "52",
+                **self.base_headers
             }
+            response = user_data['session'].post(
+                course_url,
+                headers=course_headers,
+                json={"userId": str(user_data['user_id']), "id": course_id},
+                timeout=60
+            )
+            response.raise_for_status()
+            course_response = response.json()
+            if course_response.get("state") != 200:
+                return False, "Failed to get course details"
+
+            course_details = course_response["data"]
+            pdf_url = self.clean_url(course_details.get("batchInfoPdfUrl", ""))
+
+            classes_url = f"https://backend.multistreaming.site/api/courses/{course_id}/classes?populate=full"
+            classes_headers = {"host": "backend.multistreaming.site", **self.base_headers}
+            response = user_data['session'].get(classes_url, headers=classes_headers, timeout=60)
+            response.raise_for_status()
+            classes_response = response.json()
+
+            with open("selectionway_response.json", "w", encoding="utf-8") as f:
+                json.dump(classes_response, f, ensure_ascii=False, indent=2)
+
+            if classes_response.get("state") == 200:
+                return True, {
+                    "classes_data": classes_response["data"],
+                    "pdf_url": pdf_url,
+                    "course_details": course_details
+                }
+            return False, "Failed to get course data"
         except Exception as e:
             return False, f"Error: {e}"
 
     def format_batches_list(self, courses_data, list_type="all"):
         if not courses_data:
             return "No batches found!", []
-        batches = []
+        message = "📚 *All Available Batches*\n\n" if list_type == "all" else "📚 *Your Batches*\n\n"
+        batch_list = []
         if list_type == "all":
-            batches = list(courses_data)
+            batch_list.extend(courses_data)
         else:
             for group in courses_data:
-                batches.extend(group.get("liveCourses", []) or [])
-                batches.extend(group.get("recordedCourses", []) or [])
-        if not batches:
+                batch_list.extend(group.get("liveCourses", []))
+                batch_list.extend(group.get("recordedCourses", []))
+        if not batch_list:
             return "❌ No batches found!", []
-        out = "📚 *All Available Batches*\n\n" if list_type == "all" else "📚 *Your Batches*\n\n"
-        for i, c in enumerate(batches, 1):
-            out += f"*{i}. {c.get('title','Unknown')}*\n"
-            out += f"🆔 `{c.get('id','N/A')}`\n\n"
-        out += "👉 Reply with batch number" if list_type == "my" else "👉 Reply with batch ID"
-        return out, batches
+        for i, course in enumerate(batch_list, 1):
+            title = course.get('title', 'Unknown')
+            course_id = course.get('id', 'N/A')
+            price = course.get('discountPrice', course.get('price', 'N/A'))
+            category = course.get('mainCategory', {}).get('mainCategoryName', 'General')
+            course_type = "🔴 LIVE" if course.get('isLive') else "📹 RECORDED"
+            message += f"*{i}. {title}*\n"
+            message += f"   🆔 `{course_id}`\n"
+            message += f"   📁 {category}\n"
+            message += f"   💰 ₹{price} | {course_type}\n"
+            message += f"   📖 {course.get('short_description', 'No description')}\n\n"
+        message += "👉 Reply with batch number to extract (e.g., `1`)" if list_type == "my" else "👉 Reply with *batch ID* to extract"
+        return message, batch_list
 
-    def extract_all_data(self, classes_data, pdf_url):
-        """
-        IMPORTANT:
-        Uses the API's actual hierarchy:
-          data.classes[] = topic objects
-          topic.classes[] = classes
-        No class-name matching and no merging of separate topic objects.
-        Each topic is completely written before the next topic.
-        Class order is the order in that topic's classes[] array.
-        """
-        topics = classes_data.get("classes", []) if isinstance(classes_data, dict) else []
-        result = []
+    def extract_all_data(self, classes_data, pdf_url, course_details):
+        groups = []
+        batch_pdf = self.clean_url(pdf_url) if pdf_url else ""
+        raw_topics = classes_data.get("classes", []) if isinstance(classes_data, dict) else []
 
-        for topic_obj in topics:
-            if not isinstance(topic_obj, dict):
+        def priority_key(cls):
+            value = cls.get("priority")
+            try:
+                return (value is None, int(value))
+            except (TypeError, ValueError):
+                return (True, 0)
+
+        current_group = None
+        current_main_folder = None
+
+        # Preserve the API/app topic-group sequence. Never merge topic names
+        # globally: the same topic can occur again later in the response.
+        for topic_group in raw_topics:
+            if not isinstance(topic_group, dict):
                 continue
 
-            topic_name = str(topic_obj.get("topicName") or "").strip()
-            classes = topic_obj.get("classes", []) or []
+            wrapper_topic = str(topic_group.get("topicName") or topic_group.get("title") or "Unknown Topic").strip()
+            raw_classes = [c for c in (topic_group.get("classes") or []) if isinstance(c, dict)]
+            if not raw_classes:
+                continue
 
-            # Preserve the API's topic object as one unit.
-            topic_block = {
-                "topic": topic_name,
-                "topic_id": topic_obj.get("topicId"),
-                "classes": [],
-            }
+            # Sort ONLY within this exact topic group.
+            raw_classes.sort(key=priority_key)
 
-            for cls in classes:
-                if not isinstance(cls, dict):
-                    continue
+            section_buckets = []
+            section_map = {}
+            for cls in raw_classes:
+                section_obj = cls.get("section") or {}
+                main_folder = str(section_obj.get("sectionName") or cls.get("sectionName") or "Unknown Section").strip()
+                if main_folder not in section_map:
+                    bucket = {"main_folder": main_folder, "classes": []}
+                    section_map[main_folder] = bucket
+                    section_buckets.append(bucket)
+                section_map[main_folder]["classes"].append(cls)
 
-                videos = []
-                for rec in cls.get("mp4Recordings", []) or []:
-                    if isinstance(rec, dict) and rec.get("url"):
-                        videos.append((str(rec.get("quality") or ""), str(rec["url"]).strip()))
+            for bucket in section_buckets:
+                main_folder = bucket["main_folder"]
+                if current_group is None or current_main_folder != main_folder:
+                    current_group = {"main_folder": main_folder, "topics": []}
+                    groups.append(current_group)
+                    current_main_folder = main_folder
 
-                video_url = ""
-                if videos:
-                    # Prefer quality without changing class order.
-                    quality_rank = {"720p": 0, "480p": 1, "360p": 2, "240p": 3}
-                    videos.sort(key=lambda x: quality_rank.get(x[0], 99))
-                    quality, video_url = videos[0]
-                else:
-                    quality = ""
-                    video_url = str(cls.get("class_link") or "").strip()
+                topic_entry = {"topic": wrapper_topic, "classes": []}
+                for cls in bucket["classes"]:
+                    class_title = str(cls.get("title") or "Unknown Class").strip()
+                    recordings = cls.get("mp4Recordings") or []
+                    best_url = ""
+                    for quality in ("720p", "480p", "360p"):
+                        for rec in recordings:
+                            if isinstance(rec, dict) and rec.get("quality") == quality and rec.get("url"):
+                                best_url = self.clean_url(rec["url"])
+                                break
+                        if best_url:
+                            break
+                    if not best_url:
+                        best_url = self.clean_url(cls.get("class_link", ""))
 
-                pdfs = []
-                for p in cls.get("classPdf", []) or []:
-                    if isinstance(p, dict) and p.get("url"):
-                        pdfs.append(self.clean_url(p["url"]))
-                    elif isinstance(p, str) and p.strip():
-                        pdfs.append(self.clean_url(p.strip()))
+                    pdfs = []
+                    for pdf in cls.get("classPdf") or []:
+                        purl = pdf.get("url", "") if isinstance(pdf, dict) else (pdf if isinstance(pdf, str) else "")
+                        if purl:
+                            pdfs.append(self.clean_url(purl))
+                    if not best_url and not pdfs:
+                        continue
 
-                topic_block["classes"].append({
-                    "title": str(cls.get("title") or "Unknown Title").strip(),
-                    "video_url": self.clean_url(video_url),
-                    "quality": quality,
-                    "pdfs": pdfs,
-                })
+                    topic_entry["classes"].append({
+                        "topic": wrapper_topic, "class_name": class_title,
+                        "video": best_url, "pdfs": pdfs, "priority": cls.get("priority")
+                    })
 
-            result.append(topic_block)
+                if topic_entry["classes"]:
+                    current_group["topics"].append(topic_entry)
 
-        return result, self.clean_url(pdf_url) if pdf_url else ""
+        return groups, batch_pdf
 
-    def create_course_file(self, course_name, topic_blocks, batch_pdf):
-        safe = "".join(c for c in course_name if c.isalnum() or c in " -_").strip()
-        filename = f"{safe.replace(' ', '_') or 'SelectionWay'}.txt"
-        videos = pdfs = 0
+
+    def create_course_file(self, course_name, groups, batch_pdf):
+        clean_name = "".join(c for c in course_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+        filename = f"{clean_name.replace(' ', '_')}.txt"
+        total_videos = 0
+        total_pdfs = 0
 
         with open(filename, "w", encoding="utf-8") as f:
             f.write(f"🎯 {course_name}\n\n")
-
             if batch_pdf:
-                f.write(f"Batch Info PDF : {batch_pdf}\n\n")
-                pdfs += 1
+                f.write("📄 BATCH INFO PDF\n")
+                f.write(f"Batch Info PDF : {batch_pdf}\n")
 
-            for topic in topic_blocks:
-                topic_name = topic["topic"]
-                # Main folder/section comes from the class object's section field.
-                # Since the API groups the response by topic, do not infer hierarchy
-                # from class title names.
-                current_main = None
+            for group in groups:
+                main_folder = group["main_folder"]
+                for topic_group in group.get("topics", []):
+                    topic_name = topic_group["topic"]
+                    for item in topic_group.get("classes", []):
+                        prefix = f'{main_folder} | {topic_name} | {item["class_name"]}'
+                        if item.get("video"):
+                            f.write(f'{prefix} : {item["video"]}\n')
+                            total_videos += 1
+                        for pdf in item.get("pdfs", []):
+                            f.write(f'{prefix} PDF : {pdf}\n')
+                            total_pdfs += 1
 
-                for cls in topic["classes"]:
-                    title = cls["title"]
-                    # Each class carries its own section in the API; the topic object
-                    # remains the authoritative grouping boundary.
-                    # Use the class's sectionName when available.
-                    main_folder = ""
-                    # section data is retained in API class objects; unavailable here
-                    # only if the API omitted it.
-                    # The topic is always included.
-                    parts = [x for x in [main_folder, topic_name, title] if x]
+        return filename, total_videos, total_pdfs
 
-                    # Keep the requested class-wise order: video, then that class's PDFs.
-                    prefix = " | ".join(parts)
-
-                    if cls["video_url"]:
-                        f.write(f"{prefix} : {cls['video_url']}\n")
-                        videos += 1
-                    for p in cls["pdfs"]:
-                        f.write(f"{prefix} PDF : {p}\n")
-                        pdfs += 1
-                    f.write("\n")
-
-        return filename, videos, pdfs
 
 
 bot = SelectionWayBot()
@@ -288,105 +334,196 @@ bot = SelectionWayBot()
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("🔐 Login & Extract", callback_data="login_extract")],
-        [InlineKeyboardButton("📚 List All Batches", callback_data="list_batches")],
+        [InlineKeyboardButton("📚 List All Batches", callback_data="list_batches")]
     ]
     await update.message.reply_text(
         "🤖 *SelectionWay Extractor Bot*\n\nChoose an option:",
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
+        parse_mode='Markdown'
     )
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    if q.data == "login_extract":
-        context.user_data["awaiting_login"] = True
-        await q.edit_message_text(
-            "🔐 *Login Required*\n\nSend:\n`email:password`",
-            parse_mode="Markdown",
+    query = update.callback_query
+    await query.answer()
+    if query.data == "login_extract":
+        context.user_data['awaiting_login'] = True
+        context.user_data['action_type'] = 'login_extract'
+        await query.edit_message_text(
+            "🔐 *Login Required*\n\nPlease send your login credentials in this format:\n`email:password`",
+            parse_mode='Markdown'
         )
-        return
+    elif query.data == "list_batches":
+        await query.edit_message_text("🔄 Loading all batches...")
 
-    await q.edit_message_text("🔄 Loading all batches...")
-    ok, result = await bot.get_all_batches()
-    if not ok:
-        await q.edit_message_text(f"❌ {result}")
-        return
-    text, batches = bot.format_batches_list(result, "all")
-    context.user_data["all_batches"] = batches
-    context.user_data["awaiting_batch_id"] = True
-    await q.edit_message_text(text, parse_mode="Markdown")
+        try:
+            success, result = await bot.get_all_batches()
+
+            if not success:
+                await query.edit_message_text(f"❌ {result}")
+                return
+
+            # Save the complete batch list first.
+            context.user_data['all_batches'] = result
+            context.user_data['awaiting_batch_id'] = True
+            context.user_data['action_type'] = 'all_batches'
+
+            if not result:
+                await query.edit_message_text("❌ No active batches found.")
+                return
+
+            # Telegram messages have a ~4096 character limit.  The old code
+            # tried to edit one message with the complete list, so a large
+            # batch list could fail and leave "Loading all batches..." stuck.
+            chunks = []
+            current = "📚 *All Available Batches*\n\n"
+
+            for i, course in enumerate(result, 1):
+                title = str(course.get("title", "Unknown")).strip()
+                course_id = str(course.get("id", "N/A")).strip()
+                price = course.get("discountPrice", course.get("price", "N/A"))
+                category = (
+                    course.get("mainCategory", {}) or {}
+                ).get("mainCategoryName", "General")
+                course_type = (
+                    "🔴 LIVE" if course.get("isLive") else "📹 RECORDED"
+                )
+
+                entry = (
+                    f"*{i}. {title}*\n"
+                    f"   🆔 `{course_id}`\n"
+                    f"   📁 {category}\n"
+                    f"   💰 ₹{price} | {course_type}\n\n"
+                )
+
+                if len(current) + len(entry) > 3800:
+                    chunks.append(current)
+                    current = "📚 *All Available Batches (continued)*\n\n"
+
+                current += entry
+
+            if current.strip():
+                chunks.append(current)
+
+            # Show the first chunk by editing the button message.
+            await query.edit_message_text(
+                chunks[0],
+                parse_mode='Markdown'
+            )
+
+            # Send remaining chunks separately.
+            for chunk in chunks[1:]:
+                await query.message.reply_text(
+                    chunk,
+                    parse_mode='Markdown'
+                )
+
+            await query.message.reply_text(
+                "👉 Send the *batch ID* of the course you want to extract.",
+                parse_mode='Markdown'
+            )
+
+        except Exception as e:
+            logger.exception("Error while loading batches")
+            try:
+                await query.edit_message_text(
+                    f"❌ Failed to load batches:\n`{str(e)[:300]}`",
+                    parse_mode='Markdown'
+                )
+            except Exception:
+                await query.message.reply_text(
+                    f"❌ Failed to load batches: {str(e)[:300]}"
+                )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.message.from_user.id
-    text = update.message.text.strip()
+    user_id = update.message.from_user.id
+    text = update.message.text or ""
 
-    if context.user_data.get("awaiting_login"):
+    if context.user_data.get('awaiting_login'):
         if ":" not in text:
-            await update.message.reply_text("❌ Format: `email:password`", parse_mode="Markdown")
+            await update.message.reply_text("❌ Invalid format! Please use: `email:password`", parse_mode='Markdown')
             return
         email, password = text.split(":", 1)
-        ok, msg = await bot.login_user(email.strip(), password.strip(), uid)
-        await update.message.reply_text(msg)
-        if not ok:
+        await update.message.reply_text("🔄 Logging in...")
+        success, message = await bot.login_user(email.strip(), password.strip(), user_id)
+        if not success:
+            await update.message.reply_text(message)
             return
-        context.user_data["awaiting_login"] = False
-        ok, data = await bot.get_my_batches(uid)
-        if ok:
-            listing, batches = bot.format_batches_list(data, "my")
-            context.user_data["my_batches"] = batches
-            context.user_data["awaiting_batch_selection"] = True
-            await update.message.reply_text(listing, parse_mode="Markdown")
+        context.user_data['awaiting_login'] = False
+        await update.message.reply_text("🔄 Loading your batches...")
+        success, my_batches = await bot.get_my_batches(user_id)
+        if success:
+            formatted_list, batch_list = bot.format_batches_list(my_batches, "my")
+            context.user_data['my_batches'] = batch_list
+            context.user_data['awaiting_batch_selection'] = True
+            await update.message.reply_text(formatted_list, parse_mode='Markdown')
         else:
-            await update.message.reply_text(f"❌ {data}")
+            await update.message.reply_text(f"✅ Login successful but {my_batches}")
         return
 
-    if context.user_data.get("awaiting_batch_selection"):
+    if context.user_data.get('awaiting_batch_selection'):
         if not text.isdigit():
-            await update.message.reply_text("❌ Send a valid batch number")
+            await update.message.reply_text("❌ Please enter a valid number")
             return
         n = int(text)
-        batches = context.user_data.get("my_batches", [])
-        if not 1 <= n <= len(batches):
-            await update.message.reply_text(f"❌ Choose 1-{len(batches)}")
+        batch_list = context.user_data.get('my_batches', [])
+        if not 1 <= n <= len(batch_list):
+            await update.message.reply_text(f"❌ Please enter a number between 1 and {len(batch_list)}")
             return
-        c = batches[n - 1]
-        await extract_and_send(update, c.get("id"), c.get("title", "Course"), uid, True)
-        context.user_data["awaiting_batch_selection"] = False
+        selected = batch_list[n - 1]
+        course_id = selected.get('id')
+        course_name = selected.get('title', 'Course')
+        await update.message.reply_text(f"🔄 Extracting *{course_name}*...", parse_mode='Markdown')
+        success, result = await bot.extract_course_data_with_login(user_id, course_id, course_name)
+        if success:
+            await process_extraction_result(update, course_name, result)
+            context.user_data['awaiting_batch_selection'] = False
+        else:
+            await update.message.reply_text(f"❌ {result}")
         return
 
-    if context.user_data.get("awaiting_batch_id"):
-        batches = context.user_data.get("all_batches", [])
-        c = next((x for x in batches if x.get("id") == text), None)
-        name = c.get("title", "Course") if c else "Course"
-        await extract_and_send(update, text, name, uid, False)
-        context.user_data["awaiting_batch_id"] = False
+    if context.user_data.get('awaiting_batch_id'):
+        batch_id = text.strip()
+        batch_list = context.user_data.get('all_batches', [])
+        course_name = "Unknown Course"
+        for batch in batch_list:
+            if str(batch.get('id')) == batch_id:
+                course_name = batch.get('title', 'Unknown Course')
+                break
+        await update.message.reply_text(f"🔄 Extracting *{course_name}*...", parse_mode='Markdown')
+        success, result = await bot.extract_course_data_without_login(batch_id, course_name)
+        if success:
+            await process_extraction_result(update, course_name, result)
+            context.user_data['awaiting_batch_id'] = False
+        else:
+            await update.message.reply_text(f"❌ {result}")
+        return
+
+    if text.startswith('/'):
+        await update.message.reply_text("Please use /start to begin")
 
 
-async def extract_and_send(update, course_id, course_name, uid, logged):
-    await update.message.reply_text(f"🔄 Extracting *{course_name}*...", parse_mode="Markdown")
-    ok, result = (
-        await bot.extract_course_data_with_login(uid, course_id, course_name)
-        if logged else
-        await bot.extract_course_data_without_login(course_id, course_name)
+async def process_extraction_result(update, course_name, result):
+    groups, batch_pdf = bot.extract_all_data(
+        result["classes_data"], result["pdf_url"], result["course_details"]
     )
-    if not ok:
-        await update.message.reply_text(f"❌ {result}")
-        return
-
-    topics, batch_pdf = bot.extract_all_data(result["classes_data"], result["pdf_url"])
-    filename, nv, np = bot.create_course_file(course_name, topics, batch_pdf)
-
+    filename, total_videos, total_pdfs = bot.create_course_file(
+        course_name, groups, batch_pdf
+    )
+    total_pdf_count = total_pdfs + (1 if batch_pdf else 0)
+    caption = (
+        f"🎯 *{course_name}*\n\n"
+        f"📊 *Extraction Complete!*\n"
+        f"• 🎥 Total Videos: {total_videos}\n"
+        f"• 📄 Total PDFs: {total_pdf_count}\n"
+        f"• 📦 File: `{filename}`\n\n"
+        f"✅ *Main folder → Topic → Class → PDF order applied!*"
+    )
     try:
         with open(filename, "rb") as f:
             await update.message.reply_document(
-                document=f,
-                filename=filename,
-                caption=f"🎯 *{course_name}*\n\n🎥 Videos: {nv}\n📄 PDFs: {np}\n\n✅ Original API topic order preserved.",
-                parse_mode="Markdown",
+                document=f, filename=filename, caption=caption, parse_mode='Markdown'
             )
     finally:
         try:
@@ -397,21 +534,21 @@ async def extract_and_send(update, course_id, course_name, uid, logged):
 
 async def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Set BOT_TOKEN environment variable.")
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler, pattern="^(login_extract|list_batches)$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        raise RuntimeError("BOT_TOKEN environment variable is not set.")
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_handler, pattern="^(login_extract|list_batches)$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("🤖 Bot is running...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
     try:
         await asyncio.Event().wait()
     finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+        await application.updater.stop()
+        await application.stop()
+        await application.shutdown()
 
 
 if __name__ == "__main__":
